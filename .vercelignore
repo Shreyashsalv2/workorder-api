@@ -1,0 +1,9 @@
+tests
+docs
+.github
+migrations
+Dockerfile
+docker-compose.yml
+docker-entrypoint.sh
+.dockerignore
+requirements-dev.txt

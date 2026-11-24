@@ -1,0 +1,84 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: tests (${{ matrix.db }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlite, postgres, mysql]
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: app
+          POSTGRES_PASSWORD: app
+          POSTGRES_DB: workorders_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U app" --health-interval 5s --health-timeout 5s --health-retries 20
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: workorders_test
+          MYSQL_USER: app
+          MYSQL_PASSWORD: app
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd "mysqladmin ping -h 127.0.0.1 -uroot -proot" --health-interval 5s --health-timeout 5s --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Pick the database URL
+        run: |
+          case "${{ matrix.db }}" in
+            sqlite)   echo "DB_URL=sqlite:////tmp/ci.db" >> "$GITHUB_ENV" ;;
+            postgres) echo "DB_URL=postgresql+psycopg://app:app@127.0.0.1:5432/workorders_test" >> "$GITHUB_ENV" ;;
+            mysql)    echo "DB_URL=mysql+pymysql://app:app@127.0.0.1:3306/workorders_test" >> "$GITHUB_ENV" ;;
+          esac
+      - name: Migrations apply, roll back and re-apply
+        env:
+          FLASK_APP: app.py
+          AUTO_CREATE_TABLES: "0"
+        run: |
+          DATABASE_URL="$DB_URL" flask db upgrade
+          DATABASE_URL="$DB_URL" flask db downgrade base
+          DATABASE_URL="$DB_URL" flask db upgrade
+          DATABASE_URL="$DB_URL" flask db downgrade base
+      - name: Test suite
+        run: TEST_DATABASE_URL="$DB_URL" pytest
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t workorder-api .
+      - name: Run the image with PostgreSQL and call the API
+        run: |
+          docker network create wo
+          docker run -d --name db --network wo -e POSTGRES_USER=wo -e POSTGRES_PASSWORD=wo -e POSTGRES_DB=wo postgres:16
+          for i in $(seq 1 30); do docker exec db pg_isready -U wo && break; sleep 1; done
+          docker run -d --name api --network wo -p 8000:8000 \
+            -e DATABASE_URL=postgresql://wo:wo@db:5432/wo -e AUTO_CREATE_TABLES=0 -e PREDICTOR_RETRIES=0 workorder-api
+          for i in $(seq 1 30); do curl -sf http://localhost:8000/health && break; sleep 1; done
+          curl -sf http://localhost:8000/health | grep -q postgresql
+          curl -sf -X POST http://localhost:8000/machines -H 'Content-Type: application/json' -d '{"name":"Mill-01","product_type":"L"}'
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8000/machines -H 'Content-Type: application/json' -d '{"name":"Mill-01","product_type":"L"}')
+          test "$code" = "409"
+          curl -sf -X POST http://localhost:8000/work-orders -H 'Content-Type: application/json' -d '{"machine_id":1,"title":"Smoke test"}' | grep -q '"status":"open"'
+      - name: Container logs
+        if: always()
+        run: docker logs api || true
