@@ -61,7 +61,8 @@
     <section class="card">
       <h2>Work orders <span class="muted" id="count"></span></h2>
       <div style="overflow-x:auto"><table><thead><tr><th>#</th><th>Order</th><th>Priority</th><th>Status</th><th></th></tr></thead><tbody id="orders"></tbody></table></div>
-      <p class="note section">Demo data lives in a small SQLite database inside the serverless function, so it can reset at any time. In Docker and CI the same code runs on PostgreSQL or MySQL.</p>
+      <p class="note section" id="instanceNote" style="display:none">The list request reached a different serverless instance that has its own copy of the demo data, so the order you just created is shown from the create response.</p>
+      <p class="note section">Demo data lives in a small SQLite database inside each serverless instance, so it can reset at any time and two requests can reach different copies. In Docker and CI the same code runs on one PostgreSQL or MySQL database.</p>
     </section>
   </div>
 
@@ -91,15 +92,20 @@ async function loadMachines() {
   $("machine").innerHTML = body.items.map(m => `<option value="${m.id}">${esc(m.name)} (type ${esc(m.product_type)})</option>`).join("");
 }
 
+let created = [];  // orders this page created, in case the list request reached another instance
+
 async function loadOrders() {
   const { body } = await api("/work-orders?per_page=50");
+  const ids = new Set(body.items.map(o => o.id));
+  const missing = created.filter(o => !ids.has(o.id));
   $("count").textContent = `(${body.total})`;
-  $("orders").innerHTML = body.items.map(o => {
+  $("instanceNote").style.display = missing.length ? "" : "none";
+  $("orders").innerHTML = [...missing.map(o => ({ ...o, _otherInstance: true })), ...body.items].map(o => {
     const next = o.status === "open" ? "in_progress" : o.status === "in_progress" ? "done" : null;
     const prob = o.failure_probability != null ? ` · ${(o.failure_probability * 100).toFixed(1)}%` : "";
     return `<tr><td>${o.id}</td><td><strong>${esc(o.title)}</strong><br><span class="note">${esc(o.machine_name)}${prob}. ${esc(o.scoring_note)}</span></td>
       <td><span class="pill p-${esc(o.priority)}">${esc(o.priority)}</span></td><td>${esc(o.status.replace("_", " "))}</td>
-      <td>${next ? `<button data-id="${o.id}" data-next="${next}">${next === "done" ? "Done" : "Start"}</button>` : ""}</td></tr>`;
+      <td>${next && !o._otherInstance ? `<button data-id="${o.id}" data-next="${next}">${next === "done" ? "Done" : "Start"}</button>` : ""}</td></tr>`;
   }).join("");
   document.querySelectorAll("[data-next]").forEach(b => b.onclick = async () => {
     const res = await api(`/work-orders/${b.dataset.id}`, { method: "PATCH", body: JSON.stringify({ status: b.dataset.next }) });
@@ -115,6 +121,7 @@ $("form").onsubmit = async e => {
   $("out").textContent = "Creating… (the API is calling the prediction service)";
   const res = await api("/work-orders", { method: "POST", body: JSON.stringify(payload) });
   $("out").textContent = `POST /work-orders → ${res.status}\n` + JSON.stringify(res.body, null, 2);
+  if (res.status === 201) created.push(res.body);
   loadOrders();
 };
 
